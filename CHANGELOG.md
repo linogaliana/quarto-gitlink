@@ -9,11 +9,13 @@
 - feat: Add `extensions.gitlink.fetch-status` (GitLab only) to fetch and display the live Open/Closed/Merged status of issue and merge request references as a coloured badge, via the GitLab REST API (best-effort via `curl`, cached per render). Reads an optional token from the `GITLAB_TOKEN` environment variable (never from document metadata) for private projects or to avoid anonymous rate limits. Failed fetches (bad token, wrong path, rate limit, network error) log a warning naming the endpoint and the specific reason, rather than failing silently.
 - feat: Render the status badge (`fetch-status`) as a small coloured icon (GitHub's own glyph/colour convention: `issue-opened`/`issue-closed`, `git-pull-request`/`git-pull-request-closed`/`git-merge`) instead of a text label, in HTML output.
 - feat: Render the platform badge as the platform's logo icon instead of its text name, in HTML output, for GitHub and GitLab.
+- feat: Support GitLab file-at-commit references (`group/project@sha/path/to/file`), linking to the file in GitLab's file viewer (the "blob" view) at that commit instead of to the commit itself.
 
 ### Bug Fixes
 
 - fix: `fetch-titles` (and the new `fetch-status`) could fail silently on Windows, since `cmd.exe` errors out on the Unix `2>/dev/null` redirect used to suppress `curl` stderr; the null device is now selected per OS.
 - fix: Strip a trailing slash before the `#`/`!`/`@` delimiter in GitLab subgroup references (e.g. `subgroup/project/#123`, `subgroup/project/!456`): previously the slash was baked into the generated URL and API calls as a bogus empty path segment, breaking `fetch-status` (and, with `group` set, sometimes the link itself) with a 404.
+- fix: Recover commit and file references whose delimiter is preceded by a slash (e.g. `project/@sha`, `project/@sha/file.R`): Pandoc's markdown reader tokenises `/@` as the start of a citation, splitting the reference in two before Gitlink ever sees it as one token. The recovered text is only used when it actually resolves to a real gitlink reference, so a genuine citation or `@mention` right after a slash-ending word is never affected.
 
 ## 1.9.0 (2026-07-31)
 

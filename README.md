@@ -112,6 +112,19 @@ resolve to `mon-groupe/sous-groupe/projet` (issues), `.../merge_requests/456`, a
 > [!NOTE]
 > `group` is only resolved for `platform: gitlab`, and it replaces `repository-name`: there is no single "current project" in group mode, so bare references (`#123`, `!456`, a bare commit SHA) are left untouched — every reference must include the project path.
 
+#### File At A Commit
+
+A cross-repository commit reference followed by `/path/to/file` links to that file in GitLab's file viewer instead of the commit itself:
+
+```md
+group/project@9ba12248/path/to/file.R
+```
+
+renders as a link to `.../-/blob/9ba12248/path/to/file.R`, with the reference itself (`group/project@9ba1224/path/to/file.R`) as the link text. This also works with subgroups and with `group` set (write it relative to the group, same as issues/merge requests/commits above).
+
+> [!NOTE]
+> Like the plain commit form, avoid a `/` immediately before the `@` (e.g. `group/project/@9ba12248/file.R`): Pandoc's own markdown reader treats `/@` as the start of a citation before Gitlink ever sees the token. Gitlink recovers most of these cases automatically, but writing the reference without the extra slash (`group/project@9ba12248/file.R`) avoids relying on that recovery.
+
 ### Codeberg
 
 Official documentation: [Codeberg Documentation](https://docs.codeberg.org/) (uses Forgejo)

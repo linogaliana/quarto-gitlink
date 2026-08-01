@@ -177,6 +177,10 @@ extensions:
     fetch-status: true
 ```
 
+A commit reference followed by `/path/to/file` links to that file in GitLab's file viewer (the "blob" view) at that commit, instead of the commit itself:
+
+- File at commit: `group/project@a5c3785d/scripts/analysis.R` → `.../-/blob/a5c3785d/scripts/analysis.R`
+
 ### Codeberg
 
 Configure for Codeberg by changing the platform:

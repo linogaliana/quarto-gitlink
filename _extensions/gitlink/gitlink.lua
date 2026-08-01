@@ -1161,12 +1161,47 @@ local function process_commits(elem, current_platform, current_base_url)
   return nil, nil, nil
 end
 
---- Try the issue/MR, commit, and user matchers on a single token's text.
+--- Process "repo@sha/path" file-at-commit references, linking to the
+--- platform's file/blob view. Driven entirely by the `file` section of the
+--- platform configuration (currently only GitLab's `platforms.yml` entry
+--- defines one), so a platform without it is simply skipped.
+--- @param elem pandoc.Str The string element to process
+--- @param current_platform string The current platform name
+--- @param current_base_url string The current base URL
+--- @return pandoc.Link|nil A file link or nil if no valid pattern found
+--- @return string|nil The platform name used for this match
+--- @return string|nil The base URL used for this match
+local function process_files(elem, current_platform, current_base_url)
+  local config = get_platform_config(current_platform)
+  if not config or not config.file or str.is_empty(config.file.pattern) or str.is_empty(config.file.url_format) then
+    return nil, nil, nil
+  end
+
+  local text = elem.text
+  local repo, sha, file_path = text:match('^' .. config.file.pattern .. '$')
+  if not repo or str.is_empty(sha) or str.is_empty(file_path) then
+    return nil, nil, nil
+  end
+  if sha:len() < COMMIT_SHA_MIN_LENGTH or sha:len() > COMMIT_SHA_FULL_LENGTH then
+    return nil, nil, nil
+  end
+
+  -- Tolerate a trailing slash before the delimiter (e.g. "subgroup/project/@sha/path").
+  repo = repo:gsub('/+$', '')
+  local short_link = repo .. '@' .. sha:sub(1, COMMIT_SHA_SHORT_LENGTH) .. '/' .. file_path
+  local full_repo = apply_group_prefix(repo)
+  local uri = current_base_url ..
+      config.file.url_format:gsub('{repo}', full_repo):gsub('{sha}', sha):gsub('{path}', file_path)
+  return create_platform_link(short_link, uri, current_platform), current_platform, current_base_url
+end
+
+--- Try the issue/MR, commit, file, and user matchers on a single token's text.
 --- @param text string The token text to match
 --- @return pandoc.Link|pandoc.Span|nil A link, a badge span, or nil
 local function match_single(text)
   local elem = pandoc.Str(text)
   return process_issues_and_mrs(elem, platform, base_url)
+    or process_files(elem, platform, base_url)
     or process_commits(elem, platform, base_url)
     or process_users(elem, platform)
 end
@@ -1305,6 +1340,46 @@ local function process_gitlink(elem)
   return elem
 end
 
+--- Recover a gitlink reference Pandoc's citation parser split across a
+--- Str/Cite boundary. A slash immediately before "@" (e.g. "repo/@sha/path",
+--- from the still-common habit of writing a slash before every delimiter)
+--- makes Pandoc's reader start a citation right there, tokenising it as
+--- `Str("repo/")` followed by `Cite("sha/path")` instead of one Str -- so it
+--- never reaches `process_gitlink` as a single token.
+---
+--- The fix only ever *tries* the merge: it reconstructs the original text
+--- (the Cite's rendered content is exactly "@" plus its citation id, which
+--- can itself contain slashes) and runs it through the normal matchers. If
+--- that resolves to a real gitlink reference, the Str/Cite pair is replaced
+--- by the resulting link; if not, both are left completely untouched, so a
+--- genuine citation or @mention immediately after a slash-ending word is
+--- never at risk.
+--- @param inlines pandoc.List The block's inline content
+--- @return pandoc.List The (possibly modified) inline content
+local function merge_slash_cite_splits(inlines)
+  local result = pandoc.List({})
+  local i = 1
+  while i <= #inlines do
+    local elem = inlines[i]
+    local next_elem = inlines[i + 1]
+    if elem.t == "Str" and elem.text:sub(-1) == "/" and next_elem and next_elem.t == "Cite" then
+      local candidate = elem.text .. str.stringify(next_elem.content)
+      local link = match_single(candidate)
+      if link then
+        result:insert(link)
+        i = i + 2
+      else
+        result:insert(elem)
+        i = i + 1
+      end
+    else
+      result:insert(elem)
+      i = i + 1
+    end
+  end
+  return result
+end
+
 --- Process inline elements for Bitbucket multi-word patterns
 --- @param elem table Block element containing inline content
 --- @return table The modified element
@@ -1314,6 +1389,23 @@ local function process_inlines(elem)
   end
   if elem.content and platform == "bitbucket" then
     elem.content = bitbucket.process_inlines(elem.content, base_url, repository_name, create_platform_link)
+  end
+  return elem
+end
+
+--- Run `merge_slash_cite_splits` on a block's inline content. Registered as
+--- the *last* filter pass (after the `Str`/`Cite` passes, not alongside
+--- `process_inlines` above) so the link it produces is never walked again by
+--- a later pass: `process_gitlink` re-processing the freshly-created link's
+--- own display text produced a link nested inside a link.
+--- @param elem table Block element containing inline content
+--- @return table The modified element
+local function recover_slash_cite_splits(elem)
+  if not is_enabled then
+    return elem
+  end
+  if elem.content then
+    elem.content = merge_slash_cite_splits(elem.content)
   end
   return elem
 end
@@ -1421,5 +1513,9 @@ return {
   { Plain = process_inlines, Para = process_inlines },
   { Link = process_link },
   { Str = process_gitlink },
+  -- Between the Str and Cite passes: the Cite elements it consumes must
+  -- still be intact (process_mentions hasn't run yet), and nothing later
+  -- walks Str/Link content, so the link it produces is never re-processed.
+  { Plain = recover_slash_cite_splits, Para = recover_slash_cite_splits },
   { Cite = process_mentions }
 }

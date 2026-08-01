@@ -84,6 +84,14 @@ platforms:
       state-field: "state"
       token-env: "GITLAB_TOKEN"
       token-header: "PRIVATE-TOKEN"
+    file:
+      # The path capture uses an inclusive character class (word chars, -, _,
+      # ., +, /) rather than a permissive "match anything" one, so common
+      # trailing punctuation (a sentence period, a closing paren, a comma)
+      # isn't swallowed into the file path: excluding it here lets the
+      # generic bracket/punctuation-stripping retry handle it instead.
+      pattern: "([^/]+/[^@]+)@(%x+)/([%w%-%_%.%+/]+)"
+      url-format: "/{repo}/-/blob/{sha}/{path}"
 
   codeberg:
     display-name: Codeberg
