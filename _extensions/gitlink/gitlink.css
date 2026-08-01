@@ -26,3 +26,15 @@
 .gitlink-status-badge.gitlink-status-unknown {
   background-color: #57606a;
 }
+
+.gitlink-icon-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3em;
+  border-radius: 50%;
+  line-height: 0;
+}
+.gitlink-icon-badge svg {
+  display: block;
+}

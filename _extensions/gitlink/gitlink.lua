@@ -17,6 +17,7 @@ local bitbucket = require(quarto.utils.resolve_path('_modules/bitbucket.lua'):gs
 local platforms = require(quarto.utils.resolve_path('_modules/platforms.lua'):gsub('%.lua$', ''))
 local colour = require(quarto.utils.resolve_path('_modules/colour.lua'):gsub('%.lua$', ''))
 local widget = require(quarto.utils.resolve_path('_modules/widget.lua'):gsub('%.lua$', ''))
+local icons = require(quarto.utils.resolve_path('_modules/icons.lua'):gsub('%.lua$', ''))
 
 --- @type string The platform type (github, gitlab, codeberg, gitea, bitbucket)
 local platform = 'github'
@@ -243,6 +244,48 @@ local STATUS_STATE_COLOURS = {
   locked = '#57606a',
 }
 
+--- @type table<string, string> Octicon (or brand-icon) name for each platform's
+--- HTML badge. Platforms without an entry keep the plain-text label.
+local PLATFORM_ICON_NAMES = {
+  github = 'mark-github',
+  gitlab = 'gitlab',
+}
+
+--- @type table<string, table<string, string>> Octicon name for each
+--- ref-type/status-class combination, GitHub-style (open issue vs. open
+--- merge/pull request use different glyphs).
+local STATUS_ICON_NAMES = {
+  issue = {
+    open = 'issue-opened',
+    closed = 'issue-closed',
+    locked = 'issue-locked',
+    unknown = 'issue-opened',
+  },
+  merge_request = {
+    open = 'git-pull-request',
+    closed = 'git-pull-request-closed',
+    merged = 'git-merge',
+    locked = 'git-pull-request-locked',
+    unknown = 'git-pull-request',
+  },
+}
+
+--- Build the inline content for an HTML badge: an icon when one is known and
+--- embeds successfully, otherwise the plain-text fallback.
+--- @param icon_name string|nil The icon name to try (see `icons.get_icon`), or nil to always use text
+--- @param fallback_text string The text to use when no icon is available
+--- @return table content A one-element Pandoc inline list (RawInline SVG or Str) for the badge body
+--- @return boolean is_icon Whether the content rendered as an icon
+local function html_badge_content(icon_name, fallback_text)
+  if icon_name then
+    local svg = icons.render_icon_svg(icon_name, 14, EXTENSION_NAME)
+    if svg then
+      return { pandoc.RawInline('html', svg) }, true
+    end
+  end
+  return { pandoc.Str(fallback_text) }, false
+end
+
 --- Create a link with platform label
 --- @param text string|nil The link text
 --- @param uri string|nil The URI
@@ -263,7 +306,8 @@ local function create_platform_link(text, uri, platform_name, status)
     link_attr = pandoc.Attr('', {}, { title = platform_label })
     local link = pandoc.Link(link_content, uri --[[@as string]], '', link_attr)
 
-    local badges = {}
+    local platform_badge = nil
+    local status_badge = nil
     if show_platform_badge or status then
       local css_path = quarto.utils.resolve_path("gitlink.css")
       html_mod.ensure_html_dependency({
@@ -283,6 +327,12 @@ local function create_platform_link(text, uri, platform_name, status)
         table.insert(badge_style, 'color: ' .. badge_text_colour .. ';')
       end
 
+      local content, is_icon = html_badge_content(PLATFORM_ICON_NAMES[(platform_name --[[@as string]]):lower()],
+        platform_label)
+      if is_icon then
+        table.insert(badge_classes, 'gitlink-icon-badge')
+      end
+
       local badge_attr = pandoc.Attr(
         '',
         badge_classes,
@@ -292,30 +342,41 @@ local function create_platform_link(text, uri, platform_name, status)
           style = table.concat(badge_style, ' ')
         }
       )
-      table.insert(badges, pandoc.Span({ pandoc.Str(platform_label) }, badge_attr))
+      platform_badge = pandoc.Span(content, badge_attr)
     end
 
     if status then
+      local icon_names = STATUS_ICON_NAMES[status.ref_type or '']
+      local content, is_icon = html_badge_content(icon_names and icon_names[status.class], status.label)
+      local status_classes = { 'gitlink-badge', 'gitlink-status-badge', 'badge', 'gitlink-status-' .. status.class }
+      if is_icon then
+        table.insert(status_classes, 'gitlink-icon-badge')
+      end
       local status_attr = pandoc.Attr(
         '',
-        { 'gitlink-badge', 'gitlink-status-badge', 'badge', 'gitlink-status-' .. status.class },
+        status_classes,
         { title = status.label, ['aria-label'] = status.label .. ' status' }
       )
-      table.insert(badges, pandoc.Span({ pandoc.Str(status.label) }, status_attr))
+      status_badge = pandoc.Span(content, status_attr)
     end
 
-    if #badges > 0 then
+    if platform_badge or status_badge then
+      -- The status badge always sits immediately before the link (it reads
+      -- like a state marker, e.g. a checkbox); `badge-position` only ever
+      -- governs the platform badge, which defaults to after the link.
       local inlines = {}
-      if badge_position == "before" then
-        for _, badge in ipairs(badges) do
-          table.insert(inlines, badge)
-        end
+      if status_badge then
+        table.insert(inlines, status_badge)
+        table.insert(inlines, pandoc.Space())
+      end
+      if platform_badge and badge_position == "before" then
+        table.insert(inlines, platform_badge)
         table.insert(inlines, pandoc.Space())
         table.insert(inlines, link)
       else
         table.insert(inlines, link)
-        for _, badge in ipairs(badges) do
-          table.insert(inlines, badge)
+        if platform_badge then
+          table.insert(inlines, platform_badge)
         end
       end
       return pandoc.Span(inlines)
@@ -338,28 +399,33 @@ local function create_platform_link(text, uri, platform_name, status)
           text_colour_opt .. ', [' .. label .. ']))')
     end
 
-    local badges = {}
+    local platform_badge = nil
+    local status_badge = nil
     if show_platform_badge then
       local bg_hex = colour_to_hex(badge_background_colour)
       local text_colour_hex = not str.is_empty(badge_text_colour) and colour_to_hex(badge_text_colour --[[@as string]]) or nil
-      table.insert(badges, typst_box(platform_label, bg_hex, text_colour_hex))
+      platform_badge = typst_box(platform_label, bg_hex, text_colour_hex)
     end
     if status then
-      table.insert(badges, typst_box(status.label, STATUS_STATE_COLOURS[status.class] or '#c3c3c3', '#ffffff'))
+      status_badge = typst_box(status.label, STATUS_STATE_COLOURS[status.class] or '#c3c3c3', '#ffffff')
     end
 
-    if #badges > 0 then
+    if platform_badge or status_badge then
+      -- Same fixed order as HTML: status always immediately before the link;
+      -- `badge-position` only governs the platform badge.
       local inlines = {}
-      if badge_position == "before" then
-        for _, badge in ipairs(badges) do
-          table.insert(inlines, badge)
-        end
+      if status_badge then
+        table.insert(inlines, status_badge)
+        table.insert(inlines, pandoc.Space())
+      end
+      if platform_badge and badge_position == "before" then
+        table.insert(inlines, platform_badge)
         table.insert(inlines, pandoc.Space())
         table.insert(inlines, link)
       else
         table.insert(inlines, link)
-        for _, badge in ipairs(badges) do
-          table.insert(inlines, badge)
+        if platform_badge then
+          table.insert(inlines, platform_badge)
         end
       end
       return pandoc.Span(inlines)
@@ -784,8 +850,15 @@ local function fetch_status_for(config, current_base_url, repo, ref_type, number
   end
 
   local raw_state = str.stringify(decoded[state_field]):lower()
-  local info = STATUS_STATE_LABELS[raw_state] or
-      { label = raw_state:sub(1, 1):upper() .. raw_state:sub(2), class = 'unknown' }
+  local base = STATUS_STATE_LABELS[raw_state] or { label = raw_state:sub(1, 1):upper() .. raw_state:sub(2), class = 'unknown' }
+  -- Build a fresh table (never mutate the shared STATUS_STATE_LABELS entries,
+  -- which are reused across every call): ref_type picks the issue vs. merge
+  -- request icon in `create_platform_link`.
+  local info = {
+    label = base.label,
+    class = base.class,
+    ref_type = (ref_type == 'issue') and 'issue' or 'merge_request',
+  }
   status_cache[endpoint] = info
   return info
 end

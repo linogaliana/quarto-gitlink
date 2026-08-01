@@ -215,7 +215,7 @@ extensions:
 group/project#123
 ```
 
-renders each reference with a badge next to the link — green for open, red for closed, purple for merged.
+renders each reference with a small coloured icon badge next to the link (GitHub's own colour/glyph convention): a green circle for an open issue, a green pull-request glyph for an open merge request, red for closed, and purple for merged (`git-merge`).
 
 For private projects, or to avoid GitLab's anonymous rate limits, set the `GITLAB_TOKEN` environment variable to a token with at least read access to the project (a CI job token or a personal/project access token). The token is read from the environment at render time and is never written to the document or its metadata — do not put it in `_quarto.yml` or front matter.
 
@@ -316,8 +316,8 @@ extensions:
 
 **Features:**
 
-- **HTML output**: Badges are styled with Bootstrap classes and include tooltips. You can customise colours with hex codes or colour names.
-- **Typst output**: Badges appear as styled boxes with configurable colours.
+- **HTML output**: On GitHub and GitLab, the badge shows the platform's logo (a small inline icon); other platforms show the plain-text name. Badges are styled with Bootstrap classes and include tooltips. You can customise colours with hex codes or colour names.
+- **Typst output**: Badges appear as styled boxes with the platform name (icons are HTML-only) and configurable colours.
 - **Other formats**: Platform names appear in parentheses (e.g., `#123 (GitHub)`).
 
 **Colour Customisation:**
