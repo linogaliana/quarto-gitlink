@@ -37,5 +37,19 @@
 			"    repository-name: ${1:group/project}"
 		],
 		"description": "Activate gitlink for GitLab references"
+	},
+	"GitLab group config": {
+		"prefix": "gitlab-group-meta",
+		"body": [
+			"filters:",
+			"  - path: gitlink",
+			"    at: post-quarto",
+			"extensions:",
+			"  gitlink:",
+			"    platform: gitlab",
+			"    base-url: https://gitlab.com",
+			"    group: ${1:group/subgroup}"
+		],
+		"description": "Activate gitlink for GitLab references relative to a group or subgroup"
 	}
 }

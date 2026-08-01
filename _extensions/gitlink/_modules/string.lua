@@ -343,6 +343,17 @@ function M.ascii_id(text)
   return id
 end
 
+--- Percent-encode a string for use as a URL path segment (e.g. a GitLab
+--- namespace path used as a project id: "group/sub/project" -> "group%2Fsub%2Fproject").
+--- @param value string The value to encode
+--- @return string The encoded value
+function M.url_encode(value)
+  local encoded = value:gsub('[^%w%-%._~]', function(char)
+    return string.format('%%%02X', string.byte(char))
+  end)
+  return encoded
+end
+
 -- ============================================================================
 -- MODULE EXPORT
 -- ============================================================================

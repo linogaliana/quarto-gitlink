@@ -17,12 +17,18 @@ local bitbucket = require(quarto.utils.resolve_path('_modules/bitbucket.lua'):gs
 local platforms = require(quarto.utils.resolve_path('_modules/platforms.lua'):gsub('%.lua$', ''))
 local colour = require(quarto.utils.resolve_path('_modules/colour.lua'):gsub('%.lua$', ''))
 local widget = require(quarto.utils.resolve_path('_modules/widget.lua'):gsub('%.lua$', ''))
+local icons = require(quarto.utils.resolve_path('_modules/icons.lua'):gsub('%.lua$', ''))
 
 --- @type string The platform type (github, gitlab, codeberg, gitea, bitbucket)
 local platform = 'github'
 
 --- @type string|nil The repository name (e.g., "owner/repo")
 local repository_name = nil
+
+--- @type string|nil GitLab group (optionally with subgroups, e.g. "group/subgroup")
+--- that relative project references such as "subgroup/project#123" are
+--- resolved against.
+local group_name = nil
 
 --- @type string The base URL for the Git hosting platform
 local base_url = 'https://github.com'
@@ -57,6 +63,21 @@ local fetch_titles = false
 --- @type table<string, string> Cache of fetched titles by URL
 local title_cache = {}
 
+--- @type boolean Whether to fetch issue/merge request open/closed/merged status
+local fetch_status = false
+
+--- @type table<string, table|false> Cache of fetched {label, class} status by API URL; false means "fetched, unavailable"
+local status_cache = {}
+
+--- @type table<string, table> Display label and CSS class for each known platform state value
+local STATUS_STATE_LABELS = {
+  opened = { label = 'Open', class = 'open' },
+  open = { label = 'Open', class = 'open' },
+  closed = { label = 'Closed', class = 'closed' },
+  merged = { label = 'Merged', class = 'merged' },
+  locked = { label = 'Locked', class = 'locked' },
+}
+
 --- @type table<string, table|false> Cached platform configurations by name (per render); false means "looked up and not found"
 local platform_config_cache = {}
 
@@ -74,6 +95,12 @@ local COMMIT_SHA_MIN_LENGTH = 7
 
 --- @type string Lua pattern matching a 3-, 4-, 6-, or 8-character hex colour with leading #
 local HEX_COLOUR_PATTERN = '^#%x%x%x%x?%x?%x?%x?%x?$'
+
+--- @type string Null device for the shell `io.popen` spawns into: `NUL` on
+--- Windows (`cmd.exe` errors out on the Unix `/dev/null` path), `/dev/null`
+--- elsewhere. `package.config`'s first line is Lua's own directory separator,
+--- a reliable OS check without shelling out.
+local NULL_DEVICE = package.config:sub(1, 1) == '\\' and 'NUL' or '/dev/null'
 
 --- Validate a colour value as a hex code or CSS named colour.
 --- Returns the original value if valid, or nil if invalid.
@@ -129,6 +156,7 @@ end
 local function reset_state()
   platform = 'github'
   repository_name = nil
+  group_name = nil
   base_url = 'https://github.com'
   references_ids_set = {}
   force_mentions_set = {}
@@ -140,6 +168,8 @@ local function reset_state()
   normalize_links = true
   fetch_titles = false
   title_cache = {}
+  fetch_status = false
+  status_cache = {}
   platform_config_cache = {}
   all_platform_names_cache = nil
   if platforms.clear_custom_platforms then
@@ -205,12 +235,63 @@ local function parse_repo_url(url)
   return nil, nil, nil
 end
 
+--- @type table<string, string> Hex colour for each status class, used by the Typst status box
+local STATUS_STATE_COLOURS = {
+  open = '#1f883d',
+  closed = '#cf222e',
+  merged = '#8250df',
+  locked = '#57606a',
+}
+
+--- @type table<string, string> Octicon (or brand-icon) name for each platform's
+--- HTML badge. Platforms without an entry keep the plain-text label.
+local PLATFORM_ICON_NAMES = {
+  github = 'mark-github',
+  gitlab = 'gitlab',
+}
+
+--- @type table<string, table<string, string>> Octicon name for each
+--- ref-type/status-class combination, GitHub-style (open issue vs. open
+--- merge/pull request use different glyphs).
+local STATUS_ICON_NAMES = {
+  issue = {
+    open = 'issue-opened',
+    closed = 'issue-closed',
+    locked = 'issue-locked',
+    unknown = 'issue-opened',
+  },
+  merge_request = {
+    open = 'git-pull-request',
+    closed = 'git-pull-request-closed',
+    merged = 'git-merge',
+    locked = 'git-pull-request-locked',
+    unknown = 'git-pull-request',
+  },
+}
+
+--- Build the inline content for an HTML badge: an icon when one is known and
+--- embeds successfully, otherwise the plain-text fallback.
+--- @param icon_name string|nil The icon name to try (see `icons.get_icon`), or nil to always use text
+--- @param fallback_text string The text to use when no icon is available
+--- @return table content A one-element Pandoc inline list (RawInline SVG or Str) for the badge body
+--- @return boolean is_icon Whether the content rendered as an icon
+local function html_badge_content(icon_name, fallback_text)
+  if icon_name then
+    local svg = icons.render_icon_svg(icon_name, 14, EXTENSION_NAME)
+    if svg then
+      return { pandoc.RawInline('html', svg) }, true
+    end
+  end
+  return { pandoc.Str(fallback_text) }, false
+end
+
 --- Create a link with platform label
 --- @param text string|nil The link text
 --- @param uri string|nil The URI
 --- @param platform_name string|nil The platform name
---- @return pandoc.Link|pandoc.Span|nil A Pandoc Link element with platform label or Span containing link and badge
-local function create_platform_link(text, uri, platform_name)
+--- @param status table|nil Optional {label, class} issue/merge request status (see `fetch_status_for`)
+--- @return pandoc.Link|pandoc.Span|nil A Pandoc Link element with platform label or Span containing link and badge(s)
+local function create_platform_link(text, uri, platform_name, status)
   if str.is_empty(uri) or str.is_empty(text) or str.is_empty(platform_name) then
     return nil
   end
@@ -224,14 +305,18 @@ local function create_platform_link(text, uri, platform_name)
     link_attr = pandoc.Attr('', {}, { title = platform_label })
     local link = pandoc.Link(link_content, uri --[[@as string]], '', link_attr)
 
-    if show_platform_badge then
+    local platform_badge = nil
+    local status_badge = nil
+    if show_platform_badge or status then
       local css_path = quarto.utils.resolve_path("gitlink.css")
       html_mod.ensure_html_dependency({
         name = 'quarto-gitlink',
         version = '1.0.0',
         stylesheets = { css_path }
       })
+    end
 
+    if show_platform_badge then
       local badge_classes = { 'gitlink-badge', 'badge', 'text-bg-secondary' }
       local badge_style = {}
       if not str.is_empty(badge_background_colour) then
@@ -239,6 +324,12 @@ local function create_platform_link(text, uri, platform_name)
       end
       if not str.is_empty(badge_text_colour) then
         table.insert(badge_style, 'color: ' .. badge_text_colour .. ';')
+      end
+
+      local content, is_icon = html_badge_content(PLATFORM_ICON_NAMES[(platform_name --[[@as string]]):lower()],
+        platform_label)
+      if is_icon then
+        table.insert(badge_classes, 'gitlink-icon-badge')
       end
 
       local badge_attr = pandoc.Attr(
@@ -250,15 +341,43 @@ local function create_platform_link(text, uri, platform_name)
           style = table.concat(badge_style, ' ')
         }
       )
-      local badge = pandoc.Span({ pandoc.Str(platform_label) }, badge_attr)
+      platform_badge = pandoc.Span(content, badge_attr)
+    end
 
-      local inlines = {}
-      if badge_position == "before" then
-        inlines = { badge, pandoc.Space(), link }
-      else
-        inlines = { link, badge }
+    if status then
+      local icon_names = STATUS_ICON_NAMES[status.ref_type or '']
+      local content, is_icon = html_badge_content(icon_names and icon_names[status.class], status.label)
+      local status_classes = { 'gitlink-badge', 'gitlink-status-badge', 'badge', 'gitlink-status-' .. status.class }
+      if is_icon then
+        table.insert(status_classes, 'gitlink-icon-badge')
       end
+      local status_attr = pandoc.Attr(
+        '',
+        status_classes,
+        { title = status.label, ['aria-label'] = status.label .. ' status' }
+      )
+      status_badge = pandoc.Span(content, status_attr)
+    end
 
+    if platform_badge or status_badge then
+      -- The status badge always sits immediately before the link (it reads
+      -- like a state marker, e.g. a checkbox); `badge-position` only ever
+      -- governs the platform badge, which defaults to after the link.
+      local inlines = {}
+      if status_badge then
+        table.insert(inlines, status_badge)
+        table.insert(inlines, pandoc.Space())
+      end
+      if platform_badge and badge_position == "before" then
+        table.insert(inlines, platform_badge)
+        table.insert(inlines, pandoc.Space())
+        table.insert(inlines, link)
+      else
+        table.insert(inlines, link)
+        if platform_badge then
+          table.insert(inlines, platform_badge)
+        end
+      end
       return pandoc.Span(inlines)
     else
       return link
@@ -266,34 +385,59 @@ local function create_platform_link(text, uri, platform_name)
   elseif quarto.doc.is_format("typst") then
     local link = pandoc.Link(link_content, uri --[[@as string]], '', link_attr)
 
-    if show_platform_badge then
-      -- Typst rgb() only accepts hex strings, so convert any CSS-named colour
-      -- (already validated at Meta time) to its hex equivalent.
-      local bg_hex = colour_to_hex(badge_background_colour)
+    -- Typst rgb() only accepts hex strings, so convert any CSS-named colour
+    -- (already validated at Meta time) to its hex equivalent.
+    local function typst_box(label, bg_hex, text_colour_hex)
       local text_colour_opt = ''
-      if not str.is_empty(badge_text_colour) then
-        text_colour_opt = ', fill: rgb("' .. colour_to_hex(badge_text_colour --[[@as string]]) .. '")'
+      if not str.is_empty(text_colour_hex) then
+        text_colour_opt = ', fill: rgb("' .. text_colour_hex .. '")'
       end
-      local badge_raw = '#box(fill: rgb("' ..
+      return pandoc.RawInline('typst', ' #box(fill: rgb("' ..
           bg_hex ..
           '"), inset: 2pt, outset: 0pt, radius: 3pt, baseline: -0.3em, text(size: 0.45em' ..
-          text_colour_opt .. ', [' .. platform_label .. ']))'
-      local badge = pandoc.RawInline('typst', ' ' .. badge_raw)
+          text_colour_opt .. ', [' .. label .. ']))')
+    end
 
+    local platform_badge = nil
+    local status_badge = nil
+    if show_platform_badge then
+      local bg_hex = colour_to_hex(badge_background_colour)
+      local text_colour_hex = not str.is_empty(badge_text_colour) and colour_to_hex(badge_text_colour --[[@as string]]) or nil
+      platform_badge = typst_box(platform_label, bg_hex, text_colour_hex)
+    end
+    if status then
+      status_badge = typst_box(status.label, STATUS_STATE_COLOURS[status.class] or '#c3c3c3', '#ffffff')
+    end
+
+    if platform_badge or status_badge then
+      -- Same fixed order as HTML: status always immediately before the link;
+      -- `badge-position` only governs the platform badge.
       local inlines = {}
-      if badge_position == "before" then
-        inlines = { badge, pandoc.Space(), link }
-      else
-        inlines = { link, badge }
+      if status_badge then
+        table.insert(inlines, status_badge)
+        table.insert(inlines, pandoc.Space())
       end
-
+      if platform_badge and badge_position == "before" then
+        table.insert(inlines, platform_badge)
+        table.insert(inlines, pandoc.Space())
+        table.insert(inlines, link)
+      else
+        table.insert(inlines, link)
+        if platform_badge then
+          table.insert(inlines, platform_badge)
+        end
+      end
       return pandoc.Span(inlines)
     else
       return link
     end
   else
+    local suffix = platform_label
+    if status then
+      suffix = suffix .. ', ' .. status.label
+    end
     table.insert(link_content, pandoc.Space())
-    table.insert(link_content, pandoc.Str("(" .. platform_label .. ")"))
+    table.insert(link_content, pandoc.Str("(" .. suffix .. ")"))
     return pandoc.Link(link_content, uri --[[@as string]], '', link_attr)
   end
 end
@@ -324,6 +468,7 @@ local function get_repository(meta)
   local meta_platform = meta_mod.get_metadata_value(meta, 'gitlink', 'platform')
   local meta_base_url = meta_mod.get_metadata_value(meta, 'gitlink', 'base-url')
   local meta_repository = meta_mod.get_metadata_value(meta, 'gitlink', 'repository-name')
+  local meta_group = meta_mod.get_metadata_value(meta, 'gitlink', 'group')
   local meta_custom_platforms = meta_mod.get_metadata_value(meta, 'gitlink', 'custom-platforms-file')
 
   if not str.is_empty(meta_custom_platforms) then
@@ -393,8 +538,25 @@ local function get_repository(meta)
     repository_name = meta_repository
   elseif parsed_repo_name then
     repository_name = parsed_repo_name
+  elseif not str.is_empty(meta_group) then
+    -- Group mode: references are written relative to the group (e.g.
+    -- "subgroup/project#123"), so there is no single "current repository" to
+    -- fall back to; auto-detecting the git remote here would silently point
+    -- bare "#123"-style references at the wrong project.
+    repository_name = nil
   else
     repository_name = git.get_repository()
+  end
+
+  if not str.is_empty(meta_group) then
+    group_name = (meta_group --[[@as string]]):gsub('/$', '')
+    if platform ~= 'gitlab' then
+      log.log_warning(
+        EXTENSION_NAME,
+        "'extensions.gitlink.group' is only resolved for the 'gitlab' platform; it has no effect for '" ..
+        platform .. "'."
+      )
+    end
   end
 
   show_platform_badge = read_boolean_meta(gitlink_meta, 'show-platform-badge', true)
@@ -427,6 +589,22 @@ local function get_repository(meta)
   local fetch_titles_meta = gitlink_meta and gitlink_meta['fetch-titles']
   if fetch_titles_meta ~= nil then
     fetch_titles = (str.stringify(fetch_titles_meta):lower() == 'true')
+  end
+
+  -- Default-false flag: fetches issue/merge request open/closed/merged status
+  -- from the platform's REST API (currently only configured for GitLab, via
+  -- 'status' in platforms.yml). Best-effort: network or API failures are
+  -- logged once and otherwise leave the link unstyled.
+  local fetch_status_meta = gitlink_meta and gitlink_meta['fetch-status']
+  if fetch_status_meta ~= nil then
+    fetch_status = (str.stringify(fetch_status_meta):lower() == 'true')
+  end
+  if fetch_status and not (config.status and not str.is_empty(config.status.issue_endpoint)) then
+    log.log_warning(
+      EXTENSION_NAME,
+      "'extensions.gitlink.fetch-status' is enabled but platform '" .. platform ..
+      "' has no status API configured; no status badges will be shown."
+    )
   end
 
   -- Read the optional `mentions` list (citation IDs to force-treat as mentions).
@@ -507,6 +685,183 @@ local function process_mentions(cite)
 end
 
 
+--- Prefix a matched relative project path with the configured GitLab group.
+--- Lets `sous-groupe/projet#123` resolve against `extensions.gitlink.group`
+--- instead of requiring the full namespace (group/sous-groupe/projet) in text.
+--- @param repo string The project path as matched in the text (e.g. "sous-groupe/projet")
+--- @return string The path to use for URL building
+local function apply_group_prefix(repo)
+  if str.is_empty(group_name) then
+    return repo
+  end
+  return group_name .. "/" .. repo
+end
+
+--- Substitute `{base-url}`, `{repo-encoded}`, `{repo}`, and `{number}` in a
+--- status API endpoint template. Function replacements (rather than plain
+--- string arguments) keep literal `%` characters introduced by percent-encoding
+--- from being misread as gsub capture references.
+--- @param template string The endpoint template (e.g. "{base-url}/api/v4/projects/{repo-encoded}/issues/{number}")
+--- @param current_base_url string
+--- @param repo string
+--- @param number string
+--- @return string The resolved endpoint URL
+local function resolve_status_endpoint(template, current_base_url, repo, number)
+  local resolved = template
+  resolved = resolved:gsub('{base%-url}', function() return current_base_url end)
+  resolved = resolved:gsub('{repo%-encoded}', function() return str.url_encode(repo) end)
+  resolved = resolved:gsub('{repo}', function() return repo end)
+  resolved = resolved:gsub('{number}', function() return number end)
+  return resolved
+end
+
+--- @type boolean Whether the missing/invalid-token warning has already been logged this render
+local status_token_warning_shown = false
+
+--- Build the auth header argument for a status API call from the platform's
+--- configured environment variable (e.g. `GITLAB_TOKEN`). Returns nil (an
+--- anonymous request) when no environment variable is configured, it is unset,
+--- or its value contains characters that would be unsafe to embed in the
+--- shell command line.
+--- @param status_config table The platform's `status` configuration
+--- @return string|nil The "Header-Name: value" string, or nil
+local function status_auth_header(status_config)
+  if str.is_empty(status_config.token_env) then
+    return nil
+  end
+  local token = os.getenv(status_config.token_env)
+  if str.is_empty(token) then
+    return nil
+  end
+  if (token --[[@as string]]):find('[\r\n"`$]') then
+    if not status_token_warning_shown then
+      log.log_warning(
+        EXTENSION_NAME,
+        "Ignoring '" .. status_config.token_env .. "': it contains characters that cannot be used in a request header."
+      )
+      status_token_warning_shown = true
+    end
+    return nil
+  end
+  local header_name = status_config.token_header or 'Authorization'
+  return header_name .. ': ' .. token
+end
+
+--- Log why a status fetch was abandoned, once per (unique) endpoint since
+--- `status_cache` already prevents re-fetching the same endpoint twice.
+--- @param endpoint string The API endpoint that was requested (no credentials in it: the token travels as a header, never in the URL)
+--- @param reason string Human-readable reason
+local function log_status_fetch_failure(endpoint, reason)
+  log.log_warning(
+    EXTENSION_NAME,
+    "Could not fetch status from '" .. endpoint .. "': " .. reason .. '.'
+  )
+end
+
+--- Fetch and normalise the open/closed/merged status of an issue or merge
+--- request via the platform's REST API (best-effort, cached per render).
+--- Returns nil when `fetch-status` is off, the platform has no `status`
+--- section in its configuration (only GitLab defines one currently), or the
+--- request fails for any reason; failures never abort the render (failure
+--- reasons are logged as warnings via `log_status_fetch_failure`).
+--- @param config table The platform configuration
+--- @param current_base_url string The platform base URL for this match
+--- @param repo string The fully-resolved repository/project path
+--- @param ref_type string "issue" or "merge_request" (or "pull", treated as "merge_request")
+--- @param number string The issue/merge request number
+--- @return table|nil {label, class} or nil
+local function fetch_status_for(config, current_base_url, repo, ref_type, number)
+  if not fetch_status or not config.status then
+    return nil
+  end
+  local template = ref_type == 'issue' and config.status.issue_endpoint or config.status.merge_request_endpoint
+  if str.is_empty(template) then
+    return nil
+  end
+  local endpoint = resolve_status_endpoint(template, current_base_url, repo, number)
+
+  local cached = status_cache[endpoint]
+  if cached ~= nil then
+    return cached or nil
+  end
+
+  if endpoint:find('"', 1, true) or endpoint:find("'", 1, true) then
+    log_status_fetch_failure(endpoint, 'the URL contains a quote character')
+    status_cache[endpoint] = false
+    return nil
+  end
+
+  local header_arg = ''
+  local auth_header = status_auth_header(config.status)
+  if auth_header then
+    header_arg = ' -H "' .. auth_header .. '"'
+  end
+
+  -- No `-f`/`--fail`: that flag discards the response body on HTTP errors,
+  -- which previously made every non-2xx response (bad token, private
+  -- project, wrong path, rate limit) fail completely silently. `-w` appends
+  -- the HTTP status on its own line so failures can be diagnosed instead.
+  local handle = io.popen(
+    'curl -sSL --max-time 8 -A "quarto-gitlink"' .. header_arg ..
+    ' -w "\\nGITLINK_HTTP_STATUS:%{http_code}" "' .. endpoint .. '" 2>' .. NULL_DEVICE, 'r'
+  )
+  if not handle then
+    log_status_fetch_failure(endpoint, 'could not start curl')
+    status_cache[endpoint] = false
+    return nil
+  end
+  local output = handle:read('*a') or ''
+  handle:close()
+
+  local body, http_status = output:match('^(.-)\nGITLINK_HTTP_STATUS:(%d+)%s*$')
+  if not http_status then
+    log_status_fetch_failure(endpoint, 'no response (network error, invalid base-url, or the request timed out)')
+    status_cache[endpoint] = false
+    return nil
+  end
+  if http_status == '000' then
+    log_status_fetch_failure(
+      endpoint, 'could not connect (network error, invalid base-url, or a TLS certificate problem)'
+    )
+    status_cache[endpoint] = false
+    return nil
+  end
+  if http_status ~= '200' then
+    local hint = ''
+    if http_status == '401' then
+      hint = '; check the ' .. tostring(config.status.token_env) .. ' environment variable'
+    elseif http_status == '403' or http_status == '404' then
+      hint = '; check the project path/number and that the token (if any) has access'
+    elseif http_status == '429' then
+      hint = '; rate limited, consider setting ' .. tostring(config.status.token_env)
+    end
+    log_status_fetch_failure(endpoint, 'HTTP ' .. http_status .. hint)
+    status_cache[endpoint] = false
+    return nil
+  end
+
+  local state_field = config.status.state_field or 'state'
+  local ok, decoded = pcall(quarto.json.decode, body)
+  if not ok or type(decoded) ~= 'table' or str.is_empty(decoded[state_field]) then
+    log_status_fetch_failure(endpoint, 'unexpected response format (could not find "' .. state_field .. '")')
+    status_cache[endpoint] = false
+    return nil
+  end
+
+  local raw_state = str.stringify(decoded[state_field]):lower()
+  local base = STATUS_STATE_LABELS[raw_state] or { label = raw_state:sub(1, 1):upper() .. raw_state:sub(2), class = 'unknown' }
+  -- Build a fresh table (never mutate the shared STATUS_STATE_LABELS entries,
+  -- which are reused across every call): ref_type picks the issue vs. merge
+  -- request icon in `create_platform_link`.
+  local info = {
+    label = base.label,
+    class = base.class,
+    ref_type = (ref_type == 'issue') and 'issue' or 'merge_request',
+  }
+  status_cache[endpoint] = info
+  return info
+end
+
 --- Process issues and merge requests
 --- @param elem pandoc.Str The string element to process
 --- @param current_platform string The current platform name
@@ -540,6 +895,17 @@ local function process_issues_and_mrs(elem, current_platform, current_base_url)
       ref_type = "issue"
       short_link = repo .. "#" .. number
       break
+    elseif pattern == "([^/]+/[^#]+)#(%d+)" and text:match("^([^/]+/[^#]+)#(%d+)$") then
+      local matched_repo
+      matched_repo, number = text:match("^([^/]+/[^#]+)#(%d+)$")
+      -- Tolerate a trailing slash before the delimiter (e.g. "subgroup/project/#123"):
+      -- otherwise it would end up baked into the API/project path as a bogus
+      -- empty segment.
+      matched_repo = matched_repo:gsub('/+$', '')
+      ref_type = "issue"
+      short_link = matched_repo .. "#" .. number
+      repo = apply_group_prefix(matched_repo)
+      break
     elseif pattern == "GH%-(%d+)" and text:match("^GH%-(%d+)$") then
       number = text:match("^GH%-(%d+)$")
       repo = repository_name
@@ -561,6 +927,15 @@ local function process_issues_and_mrs(elem, current_platform, current_base_url)
         repo, number = text:match("^([^/]+/[^/#]+)!(%d+)$")
         ref_type = "merge_request"
         short_link = repo .. "!" .. number
+        break
+      elseif pattern == "([^/]+/[^!]+)!(%d+)" and text:match("^([^/]+/[^!]+)!(%d+)$") then
+        local matched_repo
+        matched_repo, number = text:match("^([^/]+/[^!]+)!(%d+)$")
+        -- Tolerate a trailing slash before the delimiter (e.g. "subgroup/project/!123").
+        matched_repo = matched_repo:gsub('/+$', '')
+        ref_type = "merge_request"
+        short_link = matched_repo .. "!" .. number
+        repo = apply_group_prefix(matched_repo)
         break
       end
     end
@@ -643,7 +1018,8 @@ local function process_issues_and_mrs(elem, current_platform, current_base_url)
 
     if url_format then
       local uri = matched_base_url .. url_format:gsub("{repo}", repo):gsub("{number}", number)
-      return create_platform_link(short_link, uri, matched_platform), matched_platform, matched_base_url
+      local status = fetch_status_for(config, matched_base_url, repo, ref_type, number)
+      return create_platform_link(short_link, uri, matched_platform, status), matched_platform, matched_base_url
     end
   end
 
@@ -721,6 +1097,16 @@ local function process_commits(elem, current_platform, current_base_url)
         short_link = repo .. "@" .. commit_sha:sub(1, COMMIT_SHA_SHORT_LENGTH)
         break
       end
+    elseif pattern == "([^/]+/[^@]+)@(%x+)" and text:match("^([^/]+/[^@]+)@(%x+)$") then
+      local r, sha = text:match("^([^/]+/[^@]+)@(%x+)$")
+      -- Tolerate a trailing slash before the delimiter (e.g. "subgroup/project/@sha").
+      r = r:gsub('/+$', '')
+      if sha:len() >= COMMIT_SHA_MIN_LENGTH and sha:len() <= COMMIT_SHA_FULL_LENGTH then
+        commit_sha = sha
+        short_link = r .. "@" .. commit_sha:sub(1, COMMIT_SHA_SHORT_LENGTH)
+        repo = apply_group_prefix(r)
+        break
+      end
     elseif pattern == "(%w+)@(%x+)" and text:match("^(%w+)@(%x+)$") then
       local user, sha = text:match("^(%w+)@(%x+)$")
       if repository_name and sha:len() >= COMMIT_SHA_MIN_LENGTH and sha:len() <= COMMIT_SHA_FULL_LENGTH then
@@ -774,12 +1160,47 @@ local function process_commits(elem, current_platform, current_base_url)
   return nil, nil, nil
 end
 
---- Try the issue/MR, commit, and user matchers on a single token's text.
+--- Process "repo@sha/path" file-at-commit references, linking to the
+--- platform's file/blob view. Driven entirely by the `file` section of the
+--- platform configuration (currently only GitLab's `platforms.yml` entry
+--- defines one), so a platform without it is simply skipped.
+--- @param elem pandoc.Str The string element to process
+--- @param current_platform string The current platform name
+--- @param current_base_url string The current base URL
+--- @return pandoc.Link|nil A file link or nil if no valid pattern found
+--- @return string|nil The platform name used for this match
+--- @return string|nil The base URL used for this match
+local function process_files(elem, current_platform, current_base_url)
+  local config = get_platform_config(current_platform)
+  if not config or not config.file or str.is_empty(config.file.pattern) or str.is_empty(config.file.url_format) then
+    return nil, nil, nil
+  end
+
+  local text = elem.text
+  local repo, sha, file_path = text:match('^' .. config.file.pattern .. '$')
+  if not repo or str.is_empty(sha) or str.is_empty(file_path) then
+    return nil, nil, nil
+  end
+  if sha:len() < COMMIT_SHA_MIN_LENGTH or sha:len() > COMMIT_SHA_FULL_LENGTH then
+    return nil, nil, nil
+  end
+
+  -- Tolerate a trailing slash before the delimiter (e.g. "subgroup/project/@sha/path").
+  repo = repo:gsub('/+$', '')
+  local short_link = repo .. '@' .. sha:sub(1, COMMIT_SHA_SHORT_LENGTH) .. '/' .. file_path
+  local full_repo = apply_group_prefix(repo)
+  local uri = current_base_url ..
+      config.file.url_format:gsub('{repo}', full_repo):gsub('{sha}', sha):gsub('{path}', file_path)
+  return create_platform_link(short_link, uri, current_platform), current_platform, current_base_url
+end
+
+--- Try the issue/MR, commit, file, and user matchers on a single token's text.
 --- @param text string The token text to match
 --- @return pandoc.Link|pandoc.Span|nil A link, a badge span, or nil
 local function match_single(text)
   local elem = pandoc.Str(text)
   return process_issues_and_mrs(elem, platform, base_url)
+    or process_files(elem, platform, base_url)
     or process_commits(elem, platform, base_url)
     or process_users(elem, platform)
 end
@@ -918,6 +1339,46 @@ local function process_gitlink(elem)
   return elem
 end
 
+--- Recover a gitlink reference Pandoc's citation parser split across a
+--- Str/Cite boundary. A slash immediately before "@" (e.g. "repo/@sha/path",
+--- from the still-common habit of writing a slash before every delimiter)
+--- makes Pandoc's reader start a citation right there, tokenising it as
+--- `Str("repo/")` followed by `Cite("sha/path")` instead of one Str -- so it
+--- never reaches `process_gitlink` as a single token.
+---
+--- The fix only ever *tries* the merge: it reconstructs the original text
+--- (the Cite's rendered content is exactly "@" plus its citation id, which
+--- can itself contain slashes) and runs it through the normal matchers. If
+--- that resolves to a real gitlink reference, the Str/Cite pair is replaced
+--- by the resulting link; if not, both are left completely untouched, so a
+--- genuine citation or @mention immediately after a slash-ending word is
+--- never at risk.
+--- @param inlines pandoc.List The block's inline content
+--- @return pandoc.List The (possibly modified) inline content
+local function merge_slash_cite_splits(inlines)
+  local result = pandoc.List({})
+  local i = 1
+  while i <= #inlines do
+    local elem = inlines[i]
+    local next_elem = inlines[i + 1]
+    if elem.t == "Str" and elem.text:sub(-1) == "/" and next_elem and next_elem.t == "Cite" then
+      local candidate = elem.text .. str.stringify(next_elem.content)
+      local link = match_single(candidate)
+      if link then
+        result:insert(link)
+        i = i + 2
+      else
+        result:insert(elem)
+        i = i + 1
+      end
+    else
+      result:insert(elem)
+      i = i + 1
+    end
+  end
+  return result
+end
+
 --- Process inline elements for Bitbucket multi-word patterns
 --- @param elem table Block element containing inline content
 --- @return table The modified element
@@ -927,6 +1388,23 @@ local function process_inlines(elem)
   end
   if elem.content and platform == "bitbucket" then
     elem.content = bitbucket.process_inlines(elem.content, base_url, repository_name, create_platform_link)
+  end
+  return elem
+end
+
+--- Run `merge_slash_cite_splits` on a block's inline content. Registered as
+--- the *last* filter pass (after the `Str`/`Cite` passes, not alongside
+--- `process_inlines` above) so the link it produces is never walked again by
+--- a later pass: `process_gitlink` re-processing the freshly-created link's
+--- own display text produced a link nested inside a link.
+--- @param elem table Block element containing inline content
+--- @return table The modified element
+local function recover_slash_cite_splits(elem)
+  if not is_enabled then
+    return elem
+  end
+  if elem.content then
+    elem.content = merge_slash_cite_splits(elem.content)
   end
   return elem
 end
@@ -949,7 +1427,7 @@ local function fetch_title_for(uri)
     return nil
   end
   local handle = io.popen(
-    'curl -fsSL --max-time 5 -A "quarto-gitlink" "' .. uri .. '" 2>/dev/null', 'r'
+    'curl -fsSL --max-time 5 -A "quarto-gitlink" "' .. uri .. '" 2>' .. NULL_DEVICE, 'r'
   )
   if not handle then
     log.log_warning(EXTENSION_NAME, "Title fetch unavailable (could not start curl).")
@@ -1034,5 +1512,9 @@ return {
   { Plain = process_inlines, Para = process_inlines },
   { Link = process_link },
   { Str = process_gitlink },
+  -- Between the Str and Cite passes: the Cite elements it consumes must
+  -- still be intact (process_mentions hasn't run yet), and nothing later
+  -- walks Str/Link content, so the link it produces is never re-processed.
+  { Plain = recover_slash_cite_splits, Para = recover_slash_cite_splits },
   { Cite = process_mentions }
 }
