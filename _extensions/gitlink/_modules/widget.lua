@@ -77,16 +77,6 @@ local function to_boolean(value, default)
   return str.stringify(value):lower() == 'true'
 end
 
---- Percent-encode a string for use as a URL path segment.
---- @param value string The value to encode
---- @return string The encoded value
-local function url_encode(value)
-  local encoded = value:gsub('[^%w%-%._~]', function(char)
-    return string.format('%%%02X', string.byte(char))
-  end)
-  return encoded
-end
-
 --- Substitute `{repo}`, `{repo-encoded}`, `{base-url}`, and `{username}`
 --- placeholders in a template. Function replacements keep literal `%` in the
 --- substituted values from being interpreted as gsub captures.
@@ -95,7 +85,7 @@ end
 --- @return string The resolved string
 local function resolve_template(template, context)
   local resolved = template
-  resolved = resolved:gsub('{repo%-encoded}', function() return url_encode(context.repo or '') end)
+  resolved = resolved:gsub('{repo%-encoded}', function() return str.url_encode(context.repo or '') end)
   resolved = resolved:gsub('{repo}', function() return context.repo or '' end)
   resolved = resolved:gsub('{base%-url}', function() return context.base_url or '' end)
   resolved = resolved:gsub('{username}', function() return context.username or '' end)

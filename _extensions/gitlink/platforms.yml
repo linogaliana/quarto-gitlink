@@ -50,13 +50,13 @@ platforms:
     patterns:
       issue:
         - "#(%d+)"
-        - "([^/]+/[^/#]+)#(%d+)"
+        - "([^/]+/[^#]+)#(%d+)"
       merge-request:
         - "!(%d+)"
-        - "([^/]+/[^/#]+)!(%d+)"
+        - "([^/]+/[^!]+)!(%d+)"
       commit:
         - "^(%x+)$"
-        - "([^/]+/[^/@]+)@(%x+)"
+        - "([^/]+/[^@]+)@(%x+)"
         - "(%w+)@(%x+)"
       user: "@([%w%-%.]+)"
     url-formats:
@@ -78,6 +78,12 @@ platforms:
         endpoint: "{base-url}/api/v4/projects/{repo-encoded}"
         stars-field: "star_count"
         forks-field: "forks_count"
+    status:
+      issue-endpoint: "{base-url}/api/v4/projects/{repo-encoded}/issues/{number}"
+      merge-request-endpoint: "{base-url}/api/v4/projects/{repo-encoded}/merge_requests/{number}"
+      state-field: "state"
+      token-env: "GITLAB_TOKEN"
+      token-header: "PRIVATE-TOKEN"
 
   codeberg:
     display-name: Codeberg

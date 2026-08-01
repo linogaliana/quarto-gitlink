@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### New Features
+
+- feat: Support GitLab subgroups in cross-repository issue, merge request, and commit references (`group/subgroup/project#123`, `!456`, `@sha`), for any number of nested segments.
+- feat: Add `extensions.gitlink.group` (GitLab only) so references can be written relative to a group or group/subgroup (e.g. `subgroup/project#123`) without repeating the group name on every reference; replaces `repository-name` and disables bare (`#123`-style) references, since there is no single current project in group mode.
+- feat: Add `extensions.gitlink.fetch-status` (GitLab only) to fetch and display the live Open/Closed/Merged status of issue and merge request references as a coloured badge, via the GitLab REST API (best-effort via `curl`, cached per render). Reads an optional token from the `GITLAB_TOKEN` environment variable (never from document metadata) for private projects or to avoid anonymous rate limits. Failed fetches (bad token, wrong path, rate limit, network error) log a warning naming the endpoint and the specific reason, rather than failing silently.
+
+### Bug Fixes
+
+- fix: `fetch-titles` (and the new `fetch-status`) could fail silently on Windows, since `cmd.exe` errors out on the Unix `2>/dev/null` redirect used to suppress `curl` stderr; the null device is now selected per OS.
+- fix: Strip a trailing slash before the `#`/`!`/`@` delimiter in GitLab subgroup references (e.g. `subgroup/project/#123`, `subgroup/project/!456`): previously the slash was baked into the generated URL and API calls as a bogus empty path segment, breaking `fetch-status` (and, with `group` set, sometimes the link itself) with a 404.
+
 ## 1.9.0 (2026-07-31)
 
 ### New Features

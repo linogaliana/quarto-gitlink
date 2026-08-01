@@ -29,6 +29,9 @@ options:
   repository-name:
     type: string
     description: "Repository in 'owner/repo' format, auto-detected from the git remote when not set."
+  group:
+    type: string
+    description: "GitLab group (optionally with subgroups, e.g. 'group/subgroup') that relative project references such as 'subgroup/project#123', 'subgroup/project!456', and 'subgroup/project@sha' are resolved against. GitLab only; overrides 'repository-name' auto-detection."
   base-url:
     type: string
     description: "Base URL for the Git hosting platform, defaulting to the platform's standard URL."
@@ -74,6 +77,10 @@ options:
     type: boolean
     default: false
     description: "Whether to fetch the page title for autolinked platform URLs and use it as the link text, requiring network access via curl."
+  fetch-status:
+    type: boolean
+    default: false
+    description: "Whether to fetch and display the open/closed/merged status of issue and merge request references as a coloured badge, requiring network access via curl. Currently only configured for GitLab; set the GITLAB_TOKEN environment variable for private projects or to avoid anonymous rate limits."
   mentions:
     type: array
     description: "List of citation IDs to force-treat as Git hosting mentions even when a bibliography reference with the same id exists."

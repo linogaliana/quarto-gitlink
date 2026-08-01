@@ -83,6 +83,35 @@ extensions:
 - Commits: `9ba12248`, `group/project@9ba12248`
 - Users: `@username`
 
+#### Groups With Subgroups
+
+Cross-repository references accept any number of `/`-separated segments, so nested GitLab subgroups work without any extra configuration:
+
+- Issues: `group/subgroup/project#123`
+- Merge Requests: `group/subgroup/project!456`
+- Commits: `group/subgroup/project@9ba12248`
+
+Set `group` instead of `repository-name` to write references relative to a group (or group/subgroup), without repeating it on every reference:
+
+```yaml
+extensions:
+  gitlink:
+    platform: gitlab
+    base-url: https://gitlab.com
+    group: mon-groupe   # or "mon-groupe/mon-sous-groupe"
+```
+
+```md
+sous-groupe/projet#123
+sous-groupe/projet!456
+sous-groupe/projet@9ba12248
+```
+
+resolve to `mon-groupe/sous-groupe/projet` (issues), `.../merge_requests/456`, and `.../commit/9ba12248`, while the link text stays the short relative form (`sous-groupe/projet#123`).
+
+> [!NOTE]
+> `group` is only resolved for `platform: gitlab`, and it replaces `repository-name`: there is no single "current project" in group mode, so bare references (`#123`, `!456`, a bare commit SHA) are left untouched — every reference must include the project path.
+
 ### Codeberg
 
 Official documentation: [Codeberg Documentation](https://docs.codeberg.org/) (uses Forgejo)
@@ -171,6 +200,32 @@ extensions:
     fetch-titles: true   # default: false; requires network access
 ```
 
+### Issue/Merge Request Status Badges
+
+On GitLab, issue and merge request references can show their live status (Open, Closed, Merged) as a coloured badge, fetched from the GitLab REST API at render time (best-effort via `curl`):
+
+```yaml
+extensions:
+  gitlink:
+    fetch-status: true   # default: false; requires network access
+```
+
+```md
+!456
+group/project#123
+```
+
+renders each reference with a badge next to the link — green for open, red for closed, purple for merged.
+
+For private projects, or to avoid GitLab's anonymous rate limits, set the `GITLAB_TOKEN` environment variable to a token with at least read access to the project (a CI job token or a personal/project access token). The token is read from the environment at render time and is never written to the document or its metadata — do not put it in `_quarto.yml` or front matter.
+
+```bash
+GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx quarto render document.qmd
+```
+
+> [!NOTE]
+> `fetch-status` is currently only wired up for GitLab. Each unique issue/merge request is fetched at most once per render (cached in memory); a request that fails (network error, HTTP error, rate limit, unexpected response) is left without a status badge rather than breaking the render, and logs a warning naming the endpoint and the reason (e.g. `HTTP 401; check the GITLAB_TOKEN environment variable`) so a missing badge can be diagnosed from the `quarto render` output.
+
 ### Surrounding Characters and Groups
 
 References are recognised even when wrapped in brackets or punctuation, for example `(#1)`, `[#1]`, `"#1"`, `#1.`, `something(#1)`, and `.(#1).`.
@@ -242,6 +297,9 @@ The extension resolves the repository URL using the following priority order:
    ```
 
    Supports: `https://github.com/owner/repo.git`, `git@gitlab.com:group/project.git`, `ssh://git@codeberg.org/user/repo.git`.
+
+> [!NOTE]
+> On GitLab, setting `group` instead of `repository-name` skips this resolution: see [Groups With Subgroups](#groups-with-subgroups).
 
 ### Platform Badges
 

@@ -148,6 +148,35 @@ Full URL examples (automatically shortened):
 - Cross-repository issue URL: <https://gitlab.com/other-group/other-project/-/issues/789>
 - User/organisation URL: <https://gitlab.com/username>
 
+Cross-repository references also accept nested subgroups (any number of `/`-separated segments):
+
+- Nested subgroup issue: `group/subgroup/project#123`
+- Nested subgroup merge request: `group/subgroup/project!456`
+- Nested subgroup commit: `group/subgroup/project@a5c3785dc2e23c1d8e7e4d9a8b91c6f234567890`
+
+To write references relative to a group without repeating its name, set `group` instead of `repository-name`:
+
+```yaml
+extensions:
+  gitlink:
+    platform: gitlab
+    base-url: https://gitlab.com
+    group: mon-groupe   # or "mon-groupe/mon-sous-groupe"
+```
+
+`sous-groupe/projet#123`, `sous-groupe/projet!456`, and `sous-groupe/projet@a5c3785d` then resolve to `mon-groupe/sous-groupe/projet`, keeping the short relative form as the link text.
+
+Enable `fetch-status: true` to show each issue/merge request reference with a live Open/Closed/Merged badge, fetched from the GitLab API at render time (set `GITLAB_TOKEN` for private projects or to avoid anonymous rate limits):
+
+```yaml
+extensions:
+  gitlink:
+    platform: gitlab
+    base-url: https://gitlab.com
+    repository-name: group/project
+    fetch-status: true
+```
+
 ### Codeberg
 
 Configure for Codeberg by changing the platform:
