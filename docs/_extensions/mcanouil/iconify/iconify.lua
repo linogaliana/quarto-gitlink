@@ -130,6 +130,7 @@ local function resolve_size_value(size)
   if str.is_empty(size) then
     return ''
   end
+  --- @cast size string
   --- @type string|nil
   local mapped = SIZE_KEYWORDS[size]
   if mapped ~= nil then
@@ -172,6 +173,40 @@ local function is_valid_iconify_name(value)
   return value:match('^[a-z0-9-]+$') ~= nil
 end
 
+--- Read an attribute value with a surrounding quote pair removed.
+--- Quarto's body parser strips those quotes before the value reaches the
+--- shortcode, but the parser it uses for a text or attribute string (a
+--- `page-footer:` entry, for instance) hands the raw token over instead, so
+--- `aria-hidden='true'` arrives as the five-character string `'true'`.
+--- Stripping here is what makes a quoted and an unquoted value mean the same
+--- thing in every context; drop it once Quarto's parsers agree.
+--- @param kwargs table<string, any> Key-value options for the icon
+--- @param key string The attribute name to read
+--- @return string
+local function attr_value(kwargs, key)
+  --- @type string
+  local value = str.stringify(kwargs[key])
+  --- @type string
+  local quote = value:sub(1, 1)
+  if #value > 1 and (quote == '"' or quote == "'") and value:sub(-1) == quote then
+    return value:sub(2, -2)
+  end
+  return value
+end
+
+--- Build a single HTML attribute, escaping the value.
+--- Every value reaching this point is author-supplied and lands inside a
+--- double-quoted attribute, so an unescaped `"` would close the attribute
+--- early and let the rest of the value be read as markup. Going through one
+--- function rather than concatenating at each site is what keeps that from
+--- being forgotten as attributes are added.
+--- @param name string Attribute name
+--- @param value string Attribute value
+--- @return string The attribute, with a leading space
+local function html_attribute(name, value)
+  return ' ' .. name .. '="' .. str.escape_attribute(value) .. '"'
+end
+
 --- Resolve the `aria-hidden` attribute, which marks an icon as decorative.
 --- A decorative icon carries no `role`, `aria-label` or `title`, so assistive
 --- technology skips it entirely. Read from the shortcode arguments alone:
@@ -186,7 +221,7 @@ end
 --- @return boolean
 local function is_decorative(kwargs, warn)
   --- @type string
-  local value = str.stringify(kwargs['aria-hidden'])
+  local value = attr_value(kwargs, 'aria-hidden')
   if str.is_empty(value) or value == 'false' then
     return false
   end
@@ -204,6 +239,37 @@ local function is_decorative(kwargs, warn)
   return false
 end
 
+--- Fold `key=value` positional arguments back into `kwargs`.
+--- Quarto parses body shortcodes with `lpegshortcode.lua`, which reads an
+--- unquoted `key=value`, but a shortcode in a metadata field (`title:`,
+--- `subtitle:`, a navbar `text:`) goes through `astshortcode.lua`, which reads
+--- a key only when the value is quoted and otherwise hands the whole token
+--- over as a positional argument. Recovering the pair here is what makes one
+--- shortcode mean the same thing in a metadata field as in the body; drop this
+--- once Quarto's metadata parser matches its body parser.
+--- An explicitly parsed entry always wins, and an icon or set name cannot
+--- contain `=`, so the icon arguments are never captured.
+--- Pandoc splits on whitespace before the extension sees the shortcode, so an
+--- unquoted value carrying a space (`label=Hello world`) recovers its first
+--- token alone. Quoting the value remains the documented form.
+--- @param args table<integer, any> Icon arguments (icon set and name)
+--- @param kwargs table<string, any> Key-value options for the icon
+--- @return table<integer, any> Icon arguments with the recovered pairs removed
+local function recover_kwargs(args, kwargs)
+  --- @type table<integer, any>
+  local positional = {}
+  for _, arg in ipairs(args) do
+    --- @type string, string
+    local key, value = string.match(str.stringify(arg), '^([%a][%w%-]*)=(.*)$')
+    if key == nil then
+      table.insert(positional, arg)
+    elseif str.is_empty(str.stringify(kwargs[key])) then
+      kwargs[key] = value
+    end
+  end
+  return positional
+end
+
 --- Get an iconify option from arguments or metadata.
 --- Resolution order: positional/named kwargs first, then nested
 --- `extensions.iconify.<key>`, then the deprecated top-level `iconify.<key>`
@@ -214,7 +280,7 @@ end
 --- @return string The option value as a string
 local function get_iconify_options(x, arg, meta)
   --- @type string
-  local arg_value = str.stringify(arg[x])
+  local arg_value = attr_value(arg, x)
 
   if not str.is_empty(arg_value) then
     return arg_value
@@ -284,8 +350,8 @@ local function render_typst(icon, set, default_label, decorative, kwargs, meta)
   --- @type string
   local alt = ''
   if not decorative then
-    alt = str.stringify(kwargs['label'])
-    if str.is_empty(alt) then alt = str.stringify(kwargs['title']) end
+    alt = attr_value(kwargs, 'label')
+    if str.is_empty(alt) then alt = attr_value(kwargs, 'title') end
     if str.is_empty(alt) then alt = default_label end
   end
 
@@ -319,6 +385,8 @@ end
 --- @param meta table<string, any> Document metadata
 --- @return any Pandoc RawInline for HTML or Pandoc Null for other formats
 local function iconify(args, kwargs, meta)
+  args = recover_kwargs(args, kwargs)
+
   -- HTML (excluding epub which will not host the Web Component) renders the
   -- Web Component; Typst renders a cached SVG. Every other format renders
   -- nothing.
@@ -387,8 +455,8 @@ local function iconify(args, kwargs, meta)
 
   --- @type boolean
   local decorative = is_decorative(kwargs, true)
-  if decorative and (not str.is_empty(str.stringify(kwargs['label'])) or
-        not str.is_empty(str.stringify(kwargs['title']))) then
+  if decorative and (not str.is_empty(attr_value(kwargs, 'label')) or
+        not str.is_empty(attr_value(kwargs, 'title'))) then
     log.log_warning(
       EXTENSION_NAME,
       'Icon "' .. set .. ':' .. icon .. '" sets aria-hidden="true" together ' ..
@@ -404,7 +472,7 @@ local function iconify(args, kwargs, meta)
   ensure_html_deps()
 
   --- @type string
-  local attributes = ' icon="' .. set .. ':' .. icon .. '"'
+  local attributes = html_attribute('icon', set .. ':' .. icon)
 
   --- @type string
   local size = resolve_size(get_iconify_options('size', kwargs, meta))
@@ -412,11 +480,11 @@ local function iconify(args, kwargs, meta)
   local style = get_iconify_options('style', kwargs, meta)
 
   if str.is_empty(style) and not str.is_empty(size) then
-    attributes = attributes .. ' style="' .. size .. '"'
+    attributes = attributes .. html_attribute('style', size)
   elseif not str.is_empty(style) and not str.is_empty(size) then
-    attributes = attributes .. ' style="' .. style .. ';' .. size .. '"'
+    attributes = attributes .. html_attribute('style', style .. ';' .. size)
   elseif not str.is_empty(style) then
-    attributes = attributes .. ' style="' .. style .. '"'
+    attributes = attributes .. html_attribute('style', style)
   end
 
   --- A decorative icon is hidden from assistive technology, so it carries
@@ -427,43 +495,41 @@ local function iconify(args, kwargs, meta)
     role = ' aria-hidden="true"'
   else
     --- @type string
-    local aria_label = str.stringify(kwargs['label'])
+    local aria_label = attr_value(kwargs, 'label')
     if str.is_empty(aria_label) then
-      aria_label = ' aria-label="' .. default_label .. '"'
-    else
-      aria_label = ' aria-label="' .. aria_label .. '"'
+      aria_label = default_label
     end
 
     --- @type string
-    local title = str.stringify(kwargs['title'])
+    local title = attr_value(kwargs, 'title')
     if str.is_empty(title) then
-      title = ' title="' .. default_label .. '"'
-    else
-      title = ' title="' .. title .. '"'
+      title = default_label
     end
 
-    attributes = attributes .. aria_label .. title
+    attributes = attributes ..
+        html_attribute('aria-label', aria_label) ..
+        html_attribute('title', title)
   end
 
   --- @type string
   local width = get_iconify_options('width', kwargs, meta)
   if not str.is_empty(width) and str.is_empty(size) then
-    attributes = attributes .. ' width="' .. width .. '"'
+    attributes = attributes .. html_attribute('width', width)
   end
   --- @type string
   local height = get_iconify_options('height', kwargs, meta)
   if not str.is_empty(height) and str.is_empty(size) then
-    attributes = attributes .. ' height="' .. height .. '"'
+    attributes = attributes .. html_attribute('height', height)
   end
   --- @type string
   local flip = get_iconify_options('flip', kwargs, meta)
   if not str.is_empty(flip) then
-    attributes = attributes .. ' flip="' .. flip .. '"'
+    attributes = attributes .. html_attribute('flip', flip)
   end
   --- @type string
   local rotate = get_iconify_options('rotate', kwargs, meta)
   if not str.is_empty(rotate) then
-    attributes = attributes .. ' rotate="' .. rotate .. '"'
+    attributes = attributes .. html_attribute('rotate', rotate)
   end
 
   --- @type string
@@ -477,7 +543,7 @@ local function iconify(args, kwargs, meta)
   --- @type table<string, boolean>
   local valid_modes = { svg = true, style = true, bg = true, mask = true }
   if not str.is_empty(mode) and valid_modes[mode] then
-    attributes = attributes .. ' mode="' .. mode .. '"'
+    attributes = attributes .. html_attribute('mode', mode)
   end
 
   --- @type string
@@ -496,7 +562,9 @@ local function iconify(args, kwargs, meta)
       'html',
       '<span class="iconify-icon-wrapper" data-iconify-fallback' .. wrapper_hidden .. '>' ..
       '<iconify-icon' .. role .. attributes .. '></iconify-icon>' ..
-      '<span class="iconify-icon-fallback" hidden>' .. fallback .. '</span>' ..
+      --- The fallback is documented as text or an emoji, so it is escaped
+      --- rather than trusted as markup.
+      '<span class="iconify-icon-fallback" hidden>' .. str.escape_html(fallback) .. '</span>' ..
       '</span>'
     )
   end
@@ -508,7 +576,7 @@ local function iconify(args, kwargs, meta)
 end
 
 --- Render Quarto icon using the iconify function with preset styling.
---- @param args table<integer, any> Icon arguments (ignored as we're using a preset icon)
+--- @param args table<integer, any> Icon arguments (the icon is a preset, so these are read only for attributes a metadata field left unparsed)
 --- @param kwargs table<string, any>|nil Key-value options that might override default styling
 --- @param meta table<string, any> Document metadata
 --- @return any Pandoc RawInline for HTML or Pandoc Null for other formats
@@ -517,6 +585,7 @@ local function iconify_quarto(args, kwargs, meta)
   local quarto_args = { 'simple-icons:quarto' }
   --- @type table<string, any>
   local quarto_kwargs = kwargs or {}
+  recover_kwargs(args, quarto_kwargs)
   -- A decorative icon carries neither, and setting them here would re-introduce
   -- exactly what `aria-hidden` removes.
   if not is_decorative(quarto_kwargs, false) then
@@ -528,7 +597,7 @@ local function iconify_quarto(args, kwargs, meta)
 
   if not str.is_empty(quarto_kwargs['style']) then
     --- @type string
-    local style = str.stringify(quarto_kwargs['style'])
+    local style = attr_value(quarto_kwargs, 'style')
     if string.match(style, 'color:[^;]+;') then
       quarto_kwargs['style'] = string.gsub(style, 'color:[^;]+;', quarto_colour)
     else
